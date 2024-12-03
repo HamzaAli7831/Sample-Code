@@ -1,0 +1,240 @@
+
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Locale;
+import java.util.ResourceBundle;
+import java.util.TimeZone;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;a
+import org.springframework.web.bind.annotation.RestController;
+
+
+// TODO: Auto-generated Javadoc
+/**
+ * The Class WhatsAppCallback.
+ *
+ * @author Hamza
+ *
+ */
+@RestController
+public class WhatsAppCallback extends MainAPIHandler {
+
+    /** The Constant LOGGER. */
+    private static final Logger LOGGER = LoggerFactory.getLogger(WhatsAppCallback.class);
+    /** The out messages impl. */
+    @Autowired
+    private OutMessagesRepository outMessagesRepository;
+    /** The whats app messages impl. */
+    @Autowired
+    private WhatsAppMessagesRepository whatsAppMessagesRepository;
+    /** The country service. */
+    @Autowired
+    private CountryService countryService;
+    /** The system user DAO. */
+    @Autowired
+    private SystemUserDAO systemUserDAO;
+    /** The email service. */
+    @Autowired
+    private EmailService emailService;
+
+
+    @RequestMapping(value = "/whatsAppCallback", method = RequestMethod.POST)
+    public String whatsAppCallback(@RequestBody
+                                   WhatsApp whatsApp) {
+        synchronized (WhatsAppCallback.class) {
+            LOGGER.info("app: " + whatsApp.getApp() + ", timestamp: " + whatsApp.getTimestamp() + ", version: " + whatsApp.getVersion() + ", type: "
+                    + whatsApp.getType() + "### destination: " + whatsApp.getPayload().getDestination() + ", id: " + whatsApp.getPayload().getId() + ", type: "
+                    + whatsApp.getPayload().getType() + ", ts: " + whatsApp.getPayload().getTs());
+            LOGGER.info("## recieved WhatsApp object --> " + whatsApp + " ##");
+            if (whatsApp.getType().equals("message-event")) {
+                OutMessage msg = outMessagesRepository.findById(String.valueOf(whatsApp.getPayload().getId().hashCode()));
+                if (msg == null) {
+                    List<OutMessage> outMessagesList = outMessagesRepository.findByField("whatsAppMessageId", whatsApp.getPayload().getId());
+                    if (outMessagesList != null && !outMessagesList.isEmpty()) {
+                        msg = outMessagesList.get(0);
+                    } else {
+                        String msisdn = whatsApp.getPayload().getDestination();
+                        Country msisdnCountry = countryService.checkCountry(msisdn);
+                        msg = new OutMessage(String.valueOf(whatsApp.getPayload().getId().hashCode()), null, "+" + msisdn, msisdnCountry.getName(),
+                                configurationFileConstants.whatsAppSource, "Auto Generated", null, WhatsAppMessageStatus.PENDING.getValue(),
+                                WhatsAppMessageStatus.PENDING.getNameEn(), null, null, LocalDateTime.now(), 1, NotificationType.WHATSAPP.getNameEn(),
+                                LocalDateTime.now(),Constants.OutMessageFlag.PENDING,null, 0);
+
+                        outMessagesRepository.save(msg);
+                    }
+                }
+
+                switch (whatsApp.getPayload().getType()) {
+                    case "enqueued":
+                        LOGGER.info("Enqued, " + whatsApp.getPayload().getPayload().getWhatsappMessageId());
+                        msg.setStatusId(WhatsAppMessageStatus.ENQUED.getValue());
+                        msg.setStatusDescription(WhatsAppMessageStatus.ENQUED.getNameEn());
+                        //Update ID from because submitted (in sending) ID is different than WhatsApp ID
+                        msg.setWhatsAppMessageId(whatsApp.getPayload().getPayload().getWhatsappMessageId());
+                        outMessagesRepository.findAndReplace(msg);
+                        break;
+                    case "failed":
+                        LOGGER.info("Failed, " + whatsApp.getPayload().getPayload().getCode() + "---" + whatsApp.getPayload().getPayload().getReason());
+                        msg.setStatusId(WhatsAppMessageStatus.ENQUED.getValue());
+                        msg.setStatusDescription(WhatsAppMessageStatus.ENQUED.getNameEn());
+                        msg.setWhatsAppMessageId(whatsApp.getPayload().getPayload().getWhatsappMessageId());
+                        outMessagesRepository.findAndReplace(msg);
+                        break;
+                    case "sent":
+                        LOGGER.info("Sent, " + whatsApp.getPayload().getDestination());
+                        updateOutMessageCollectionStatus(whatsApp.getPayload().getId(), WhatsAppMessageStatus.SENT.getValue(),
+                                WhatsAppMessageStatus.SENT.getNameEn());
+                        break;
+                    case "delivered":
+                        System.out.println("Delivered, " + whatsApp.getPayload().getDestination());
+                        LOGGER.info("Delivered, " + whatsApp.getPayload().getPayload());
+                        updateOutMessageCollectionStatus(whatsApp.getPayload().getId(), WhatsAppMessageStatus.DELIVERED.getValue(),
+                                WhatsAppMessageStatus.DELIVERED.getNameEn());
+                        break;
+                    case "read":
+                        LOGGER.info("Read, " + whatsApp.getPayload().getDestination());
+                        updateOutMessageCollectionStatus(whatsApp.getPayload().getId(), WhatsAppMessageStatus.READ.getValue(),
+                                WhatsAppMessageStatus.READ.getNameEn());
+                        break;
+                    default:
+                        LOGGER.info("Unknown payload type " + whatsApp.getPayload().getType());
+                        break;
+                }
+            } else if (whatsApp.getType().equals("message")) {
+
+                LocalDateTime triggerTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(Long.parseLong(whatsApp.getTimestamp())),
+                        TimeZone.getDefault().toZoneId());
+                whatsApp.setSentDate(triggerTime);
+                whatsApp.setCreationDate(LocalDateTime.now());
+                whatsApp.setStatus(GeneralStatus.ACTIVE);
+                whatsAppMessagesRepository.save(whatsApp);
+                SystemUser systemUser = systemUserDAO.findByWhatsappAppName(whatsApp.getApp());
+                if (systemUser != null) {
+                    WhatsAppRecivedMessage whatsAppRecivedMessage = new WhatsAppRecivedMessage();
+                    whatsAppRecivedMessage.setWhatsAppId(whatsApp.getPayload().getId());
+                    whatsAppRecivedMessage.setMessageDate(triggerTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+                    whatsAppRecivedMessage.setMobileNumber(whatsApp.getPayload().getSender().getPhone());
+                    whatsAppRecivedMessage.setCustomerName(whatsApp.getPayload().getSender().getName());
+                    String messageType = whatsApp.getPayload().getType();
+                    whatsAppRecivedMessage.setMessageType(messageType);
+                    if (messageType.equalsIgnoreCase("image") || messageType.equalsIgnoreCase("video") || messageType.equalsIgnoreCase("file")) {
+                        whatsAppRecivedMessage.setMessageBody(whatsApp.getPayload().getPayload().getUrl());
+                        whatsAppRecivedMessage.setCaption(whatsApp.getPayload().getPayload().getCaption());
+                    } else if (messageType.equalsIgnoreCase("location")) {
+                        whatsAppRecivedMessage.setLongitude(whatsApp.getPayload().getPayload().getLongitude());
+                        whatsAppRecivedMessage.setLatitude(whatsApp.getPayload().getPayload().getLatitude());
+                    } else if (messageType.equalsIgnoreCase("text") || messageType.equalsIgnoreCase("audio")) {
+                        whatsAppRecivedMessage.setMessageBody(whatsApp.getPayload().getPayload().getText());
+                    } else if (messageType.equalsIgnoreCase("audio")) {
+                        whatsAppRecivedMessage.setMessageBody(whatsApp.getPayload().getPayload().getUrl());
+                    }
+                    LOGGER.info("whatsAppRecivedMessage  object" + whatsAppRecivedMessage.toString());
+                    // if need to send email
+                    Locale locale = systemUser.getSystemLanguage().getId().equals(Language.ENGLISH.getId())
+                            ? Locale.forLanguageTag(Language.ENGLISH.getAbbreviation())
+                            : Locale.forLanguageTag(Language.ARABIC.getAbbreviation());
+                    ResourceBundle messages = ResourceBundle.getBundle("messages", locale);
+                    String body = messages.getString("mail.messages.whatsAppReplayApi");
+                    body.replace("###", systemUser.getFirstName() + " " + systemUser.getLastName());
+                    // check whatsapp call back url
+                    if (systemUser.getWhatsappForwardUrl() != null) {
+                        boolean result = callThirdParty(whatsAppRecivedMessage, systemUser.getWhatsappForwardUrl());
+                        if (!result) {
+                            LOGGER.info("call Third Party result [" + result + "]");
+                            emailService.sendEmailNotification(messages.getString("mail.subject.whatsAppReplayApi"), systemUser.getEmail(), body, null, null);
+                        }
+                    } else {
+                        LOGGER.error("systemUser WhatsApp Forward URL is [null] ");
+                    }
+                } else {
+                    LOGGER.error("there is no systemUser with this WhatsApp Apploication Name [" + whatsApp.getApp() + "]");
+                }
+            }
+        }
+        return "";
+    }
+
+
+    private void updateOutMessageCollectionStatus(String whatsAppMessageId, int statusId, String statusValue) {
+        List<OutMessage> outMessagesList = outMessagesRepository.findByField("whatsAppMessageId", whatsAppMessageId);
+        outMessagesList.get(0).setStatusId(statusId);
+        outMessagesList.get(0).setStatusDescription(statusValue);
+        outMessagesRepository.findAndReplace(outMessagesList.get(0));
+    }
+
+
+    private boolean callThirdParty(WhatsAppRecivedMessage whatsAppRecivedMessage, String URL) {
+        try {
+            URL url = new URL(URL);
+            HttpURLConnection con = (HttpURLConnection) url.openConnection();
+            con.setRequestMethod("POST");
+            con.setReadTimeout(300000);
+            con.setDoOutput(true);
+            con.setRequestProperty("content-type", "application/json");
+            com.google.gson.JsonObject jsonObject = new com.google.gson.JsonObject();
+            jsonObject.addProperty("id", whatsAppRecivedMessage.getId());
+            jsonObject.addProperty("messageDate", whatsAppRecivedMessage.getMessageDate().toString());
+            jsonObject.addProperty("mobileNumber", whatsAppRecivedMessage.getMobileNumber());
+            jsonObject.addProperty("customerName", whatsAppRecivedMessage.getCustomerName());
+            jsonObject.addProperty("messageType", whatsAppRecivedMessage.getMessageType());
+            if (whatsAppRecivedMessage.getMessageType().equalsIgnoreCase("image") || whatsAppRecivedMessage.getMessageType().equalsIgnoreCase("video")
+                    || whatsAppRecivedMessage.getMessageType().equalsIgnoreCase("file")) {
+                jsonObject.addProperty("messageBody", whatsAppRecivedMessage.getMessageBody());
+                jsonObject.addProperty("caption", whatsAppRecivedMessage.getCaption());
+            } else if (whatsAppRecivedMessage.getMessageType().equalsIgnoreCase("location")) {
+                jsonObject.addProperty("longitude", whatsAppRecivedMessage.getLongitude());
+                jsonObject.addProperty("latitude", whatsAppRecivedMessage.getLatitude());
+            } else if (whatsAppRecivedMessage.getMessageType().equalsIgnoreCase("text") || whatsAppRecivedMessage.getMessageType().equalsIgnoreCase("audio")) {
+                jsonObject.addProperty("messageBody", whatsAppRecivedMessage.getMessageBody());
+            }
+            LOGGER.info("callThirdParty json Object" + jsonObject.toString());
+            OutputStreamWriter outputStreamWriter = new OutputStreamWriter(con.getOutputStream(), StandardCharsets.UTF_8);
+            outputStreamWriter.write(jsonObject.toString());
+            outputStreamWriter.flush();
+            BufferedReader in = new BufferedReader(new InputStreamReader(con.getInputStream()));
+            String inputLine = null;
+            StringBuffer response = new StringBuffer();
+            while ((inputLine = in.readLine()) != null) {
+                response.append(inputLine);
+            }
+            LOGGER.info("callThirdParty response  " + response);
+            in.close();
+            if (response.indexOf("200") > -1) {
+                return true;
+            }
+            return false;
+        } catch (IOException e) {
+            e.printStackTrace();
+            LOGGER.info("error " + e.getMessage());
+            return false;
+        }
+    }
+
+    @ExceptionHandler(value = Exception.class)
+    public String handleException(Exception e, Model model) {
+        LOGGER.warn("Start Method handleException :");
+        LOGGER.error("ERROR IN MessageController", e);
+        LOGGER.warn("End Method handleException :");
+        Integer applicationId = Integer.parseInt(configurationFileConstants.applicationID);
+        Utility.setApplication(model,applicationId);
+        return "redirect:error";
+    }
+
+}
